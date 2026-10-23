@@ -457,6 +457,8 @@ const mcp = new Server(
       '',
       'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
+      'reply accepts buttons (buttons: [{label: "Yes"}, {label: "No", style: "danger"}]) for decisions with a few fixed answers. A click arrives as a normal <channel> message whose text is the button label, with button="true" in its attributes; the user can still type an answer instead. Clicks pass the same access check as messages, and the buttons are removed after the first accepted click.',
+      '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
       "fetch_messages pulls real Discord history. Discord's search API isn't available to bots — if the user asks you to find an old message, fetch more history or ask them roughly when it was.",
@@ -537,6 +539,18 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             items: { type: 'string' },
             description: 'Absolute file paths to attach (images, logs, etc). Max 10 files, 25MB each.',
           },
+          buttons: {
+            type: 'array',
+            description: 'Optional answer buttons, shown under the last chunk (max 25, 5 per row). A click comes back as an inbound message whose text is the label.',
+            items: {
+              type: 'object',
+              properties: {
+                label: { type: 'string', description: 'Button text, max 80 chars. This is what you receive on click.' },
+                style: { type: 'string', enum: ['primary', 'secondary', 'success', 'danger'] },
+              },
+              required: ['label'],
+            },
+          },
         },
         required: ['chat_id', 'text'],
       },
@@ -607,6 +621,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const text = args.text as string
         const reply_to = args.reply_to as string | undefined
         const files = (args.files as string[] | undefined) ?? []
+        const rows = buildButtonRows(args.buttons)
 
         const ch = await fetchAllowedChannel(chat_id)
         if (!('send' in ch)) throw new Error('channel is not sendable')
@@ -636,6 +651,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             const sent = await ch.send({
               content: chunks[i],
               ...(i === 0 && files.length > 0 ? { files } : {}),
+              ...(i === chunks.length - 1 && rows.length > 0 ? { components: rows } : {}),
               ...(shouldReplyTo
                 ? { reply: { messageReference: reply_to, failIfNotExists: false } }
                 : {}),
@@ -800,6 +816,104 @@ client.on('interactionCreate', async (interaction: Interaction) => {
   await interaction
     .update({ content: `${interaction.message.content}\n\n${label}`, components: [] })
     .catch(() => {})
+})
+
+const BUTTON_STYLES: Record<string, ButtonStyle> = {
+  primary: ButtonStyle.Primary,
+  secondary: ButtonStyle.Secondary,
+  success: ButtonStyle.Success,
+  danger: ButtonStyle.Danger,
+}
+
+// reply's buttons param -> action rows. customId is `choice:<n>`; the label
+// itself is read back from the clicked component, so no state survives here.
+function buildButtonRows(raw: unknown): ActionRowBuilder<ButtonBuilder>[] {
+  if (raw == null) return []
+  if (!Array.isArray(raw)) throw new Error('buttons must be an array')
+  if (raw.length > 25) throw new Error('Discord allows max 25 buttons per message')
+  const seen = new Set<string>()
+  const buttons = raw.map((b, i) => {
+    const label = typeof b?.label === 'string' ? b.label.trim() : ''
+    if (!label) throw new Error(`button ${i}: label is required`)
+    if (label.length > 80) throw new Error(`button ${i}: label longer than 80 chars`)
+    if (seen.has(label)) throw new Error(`button ${i}: duplicate label "${label}"`)
+    seen.add(label)
+    const style = BUTTON_STYLES[b?.style ?? 'secondary']
+    if (style === undefined) throw new Error(`button ${i}: unknown style "${b.style}"`)
+    return new ButtonBuilder().setCustomId(`choice:${i}`).setLabel(label).setStyle(style)
+  })
+  const rows: ActionRowBuilder<ButtonBuilder>[] = []
+  for (let i = 0; i < buttons.length; i += 5) {
+    rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(buttons.slice(i, i + 5)))
+  }
+  return rows
+}
+
+// Who may answer with a button. DMs: only allowFrom, like messages. Guild
+// channels: the channel must be opted in and groupAllowFrom (if set) applies.
+// In a channel that listens to every message (requireMention: false) anyone
+// there may click; otherwise only allowFrom / groupAllowFrom members, because
+// a click carries no mention to gate on.
+function clickAllowed(interaction: Interaction, access: Access): boolean {
+  const userId = interaction.user.id
+  if (interaction.guildId === null) return access.allowFrom.includes(userId)
+  const ch = interaction.channel
+  if (!ch) return false
+  const channelId = ch.isThread() ? ch.parentId ?? ch.id : ch.id
+  const policy = access.groups[channelId]
+  if (!policy) return false
+  const groupAllowFrom = policy.allowFrom ?? []
+  if (groupAllowFrom.length > 0) return groupAllowFrom.includes(userId)
+  if ((policy.requireMention ?? true) === false) return true
+  return access.allowFrom.includes(userId)
+}
+
+// Message ids whose buttons were already answered: two quick clicks must not
+// both reach the session before the first update removes the buttons.
+const answeredChoices = new Set<string>()
+
+client.on('interactionCreate', async (interaction: Interaction) => {
+  if (!interaction.isButton()) return
+  if (!/^choice:\d{1,2}$/.test(interaction.customId)) return
+  if (interaction.message.author.id !== client.user?.id) return
+  const access = loadAccess()
+  if (!clickAllowed(interaction, access)) {
+    await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {})
+    return
+  }
+  const message_id = interaction.message.id
+  if (answeredChoices.has(message_id)) {
+    await interaction.reply({ content: 'Already answered.', ephemeral: true }).catch(() => {})
+    return
+  }
+  answeredChoices.add(message_id)
+  const c = interaction.component
+  const label = ('label' in c ? c.label : null) ?? ''
+  // Show the choice under the message; if that would pass Discord's 2000-char
+  // cap, only drop the buttons so the same message can't be answered twice.
+  const answered = `${interaction.message.content}\n\n➡️ ${label} (${interaction.user.username})`
+  await interaction
+    .update(answered.length <= MAX_CHUNK_LIMIT ? { content: answered, components: [] } : { components: [] })
+    .catch(err => process.stderr.write(`discord channel: failed to close buttons: ${err}\n`))
+  if (interaction.guildId === null) {
+    dmChannelUsers.set(interaction.channelId, interaction.user.id)
+  }
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content: label,
+      meta: {
+        chat_id: interaction.channelId,
+        message_id,
+        user: interaction.user.username,
+        user_id: interaction.user.id,
+        ts: new Date().toISOString(),
+        button: 'true',
+      },
+    },
+  }).catch(err => {
+    process.stderr.write(`discord channel: failed to deliver button click to Claude: ${err}\n`)
+  })
 })
 
 client.on('messageCreate', msg => {
