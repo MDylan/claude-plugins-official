@@ -891,7 +891,13 @@ client.on('interactionCreate', async (interaction: Interaction) => {
   const label = ('label' in c ? c.label : null) ?? ''
   // Show the choice under the message; if that would pass Discord's 2000-char
   // cap, only drop the buttons so the same message can't be answered twice.
-  const answered = `${interaction.message.content}\n\n➡️ ${label} (${interaction.user.username})`
+  // Show the name people see in the chat: server nickname, then the
+  // account's display name, then the username.
+  const m = interaction.member
+  const who = m === null ? interaction.user.displayName
+    : 'displayName' in m ? m.displayName
+    : m.nick ?? interaction.user.displayName
+  const answered = `${interaction.message.content}\n\n➡️ ${label} (${who})`
   await interaction
     .update(answered.length <= MAX_CHUNK_LIMIT ? { content: answered, components: [] } : { components: [] })
     .catch(err => process.stderr.write(`discord channel: failed to close buttons: ${err}\n`))
